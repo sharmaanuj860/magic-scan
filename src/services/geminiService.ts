@@ -52,6 +52,7 @@ export async function advancedEnhance(base64Image: string, mode: string): Promis
               text: `This is a ${mode} scan. Please enhance this document image for maximum readability. 
               If it's a book page, flatten the curvature and correct any perspective distortion. 
               Remove shadows, increase contrast, and sharpen the text. 
+              IMPORTANT: Preserve the original colors of the document. Do not convert to grayscale or black and white.
               Return ONLY the enhanced image data.`,
             },
           ],

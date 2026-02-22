@@ -19,6 +19,7 @@ import {
   ChevronRight,
   ChevronLeft,
   FileDown,
+  FileCheck,
   Type,
   Library,
   Share2,
@@ -49,8 +50,8 @@ import {
 } from '@dnd-kit/sortable';
 import { CSS } from '@dnd-kit/utilities';
 
-import { ScanMode, ScannedImage, IDCardScan, PageSize, SavedPDF } from './types';
-import { enhanceImage, createIDCardLayout, detectEdges, cropImage } from './utils/imageProcessing';
+import { ScanMode, ScannedImage, IDCardScan, PageSize, SavedPDF, ColorMode, BookStyle } from './types';
+import { enhanceImage, createIDCardLayout, detectEdges, cropImage, perspectiveWarp } from './utils/imageProcessing';
 import { generatePDF, generateIDCardPDF } from './services/pdfService';
 import { performOCR, advancedEnhance } from './services/geminiService';
 import confetti from 'canvas-confetti';
@@ -126,17 +127,69 @@ export default function App() {
   const [pdfName, setPdfName] = useState('');
   const [selectedPageSize, setSelectedPageSize] = useState<PageSize>(PageSize.A4);
   const [quality, setQuality] = useState(0.8);
+  const [colorMode, setColorMode] = useState<ColorMode>(ColorMode.COLOR);
+  const [bookStyle, setBookStyle] = useState<BookStyle>(BookStyle.ONE_BY_ONE);
+  const [performBatchOCR, setPerformBatchOCR] = useState(false);
+  const [showConfirmDownload, setShowConfirmDownload] = useState(false);
+  const [libraryFilter, setLibraryFilter] = useState<string>('ALL');
   const [edgeDetection, setEdgeDetection] = useState(false);
   const [edgeOverlay, setEdgeOverlay] = useState<string | null>(null);
   const [isCropping, setIsCropping] = useState(false);
+  const [isResizing, setIsResizing] = useState(false);
+  const [isPerspective, setIsPerspective] = useState(false);
   const [cropBox, setCropBox] = useState({ x: 10, y: 10, w: 80, h: 80 }); // Percentages
+  const [corners, setCorners] = useState([
+    { x: 10, y: 10 },
+    { x: 90, y: 10 },
+    { x: 90, y: 90 },
+    { x: 10, y: 90 }
+  ]);
   const [isDraggingCrop, setIsDraggingCrop] = useState<string | null>(null);
+
+  const handleResize = async (ratio: number | 'original') => {
+    if (!activePreview) return;
+    setIsProcessing(true);
+    
+    const img = new Image();
+    img.src = activePreview.enhancedUrl;
+    await new Promise(r => img.onload = r);
+
+    let newW = img.width;
+    let newH = img.height;
+
+    if (ratio !== 'original') {
+      if (img.width / img.height > ratio) {
+        newW = img.height * ratio;
+      } else {
+        newH = img.width / ratio;
+      }
+    }
+
+    const croppedUrl = await cropImage(activePreview.enhancedUrl, (img.width - newW) / 2, (img.height - newH) / 2, newW, newH);
+    
+    setScans(prev => prev.map(s => s.id === activePreview.id ? { ...s, enhancedUrl: croppedUrl } : s));
+    setActivePreview(prev => prev ? { ...prev, enhancedUrl: croppedUrl } : null);
+    setIsResizing(false);
+    setIsProcessing(false);
+  };
 
   const handleCropMouseMove = (e: React.MouseEvent) => {
     if (!isDraggingCrop) return;
     const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
     const x = ((e.clientX - rect.left) / rect.width) * 100;
     const y = ((e.clientY - rect.top) / rect.height) * 100;
+
+    if (isPerspective) {
+      const cornerIdx = parseInt(isDraggingCrop);
+      if (!isNaN(cornerIdx)) {
+        setCorners(prev => {
+          const next = [...prev];
+          next[cornerIdx] = { x: Math.max(0, Math.min(100, x)), y: Math.max(0, Math.min(100, y)) };
+          return next;
+        });
+      }
+      return;
+    }
 
     setCropBox(prev => {
       if (isDraggingCrop === 'move') {
@@ -200,7 +253,11 @@ export default function App() {
   // Camera Setup
   useEffect(() => {
     if (isScanning) {
-      startCamera();
+      // Small delay to ensure the video element is mounted
+      const timer = setTimeout(() => {
+        startCamera();
+      }, 300);
+      return () => clearTimeout(timer);
     } else {
       stopCamera();
     }
@@ -227,15 +284,29 @@ export default function App() {
 
   const startCamera = async () => {
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ 
-        video: { facingMode: 'environment', width: { ideal: 1920 }, height: { ideal: 1080 } } 
-      });
+      // Try environment camera first, fallback to any camera
+      let stream: MediaStream;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({ 
+          video: { facingMode: 'environment', width: { ideal: 1920 }, height: { ideal: 1080 } } 
+        });
+      } catch (e) {
+        console.warn("Environment camera failed, falling back to default", e);
+        stream = await navigator.mediaDevices.getUserMedia({ video: true });
+      }
+
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
+        // Ensure it plays
+        try {
+          await videoRef.current.play();
+        } catch (playErr) {
+          console.error("Video play failed:", playErr);
+        }
       }
     } catch (err) {
       console.error("Error accessing camera:", err);
-      alert("Could not access camera. Please check permissions.");
+      alert("Could not access camera. Please check permissions and ensure you are using HTTPS.");
       setIsScanning(false);
     }
   };
@@ -253,6 +324,12 @@ export default function App() {
 
     const video = videoRef.current;
     const canvas = canvasRef.current;
+    
+    if (video.videoWidth === 0 || video.videoHeight === 0) {
+      console.warn("Video not ready for capture yet");
+      return;
+    }
+
     canvas.width = video.videoWidth;
     canvas.height = video.videoHeight;
     const ctx = canvas.getContext('2d');
@@ -294,21 +371,35 @@ export default function App() {
     if (!activePreview) return;
     setIsProcessing(true);
     
-    // Convert percentages to pixels
     const img = new Image();
     img.src = activePreview.enhancedUrl;
     await new Promise(r => img.onload = r);
     
-    const x = (cropBox.x / 100) * img.width;
-    const y = (cropBox.y / 100) * img.height;
-    const w = (cropBox.w / 100) * img.width;
-    const h = (cropBox.h / 100) * img.height;
+    let processedUrl: string;
+
+    if (isPerspective) {
+      // Convert percentages to pixels
+      const pixelCorners = corners.map(c => ({
+        x: (c.x / 100) * img.width,
+        y: (c.y / 100) * img.height
+      }));
+      
+      // Calculate output dimensions (A4 ratio or similar)
+      const outW = 1000;
+      const outH = 1414;
+      processedUrl = await perspectiveWarp(activePreview.enhancedUrl, pixelCorners, outW, outH);
+    } else {
+      const x = (cropBox.x / 100) * img.width;
+      const y = (cropBox.y / 100) * img.height;
+      const w = (cropBox.w / 100) * img.width;
+      const h = (cropBox.h / 100) * img.height;
+      processedUrl = await cropImage(activePreview.enhancedUrl, x, y, w, h);
+    }
     
-    const croppedUrl = await cropImage(activePreview.enhancedUrl, x, y, w, h);
-    
-    setScans(prev => prev.map(s => s.id === activePreview.id ? { ...s, enhancedUrl: croppedUrl } : s));
-    setActivePreview(prev => prev ? { ...prev, enhancedUrl: croppedUrl } : null);
+    setScans(prev => prev.map(s => s.id === activePreview.id ? { ...s, enhancedUrl: processedUrl } : s));
+    setActivePreview(prev => prev ? { ...prev, enhancedUrl: processedUrl } : null);
     setIsCropping(false);
+    setIsPerspective(false);
     setIsProcessing(false);
   };
 
@@ -379,16 +470,38 @@ export default function App() {
 
   const confirmSave = async () => {
     setIsProcessing(true);
+    
+    let finalScans = [...scans];
+    let finalIdCardScan = { ...idCardScan };
+
+    if (performBatchOCR) {
+      if (mode === ScanMode.ID_CARD) {
+        if (finalIdCardScan.front) {
+          const text = await performOCR(finalIdCardScan.front.enhancedUrl);
+          finalIdCardScan.front = { ...finalIdCardScan.front, ocrText: text };
+        }
+        if (finalIdCardScan.back) {
+          const text = await performOCR(finalIdCardScan.back.enhancedUrl);
+          finalIdCardScan.back = { ...finalIdCardScan.back, ocrText: text };
+        }
+      } else {
+        finalScans = await Promise.all(scans.map(async (scan) => {
+          const text = await performOCR(scan.enhancedUrl);
+          return { ...scan, ocrText: text };
+        }));
+      }
+    }
+
     let blob: Blob;
     let thumbnail: string = '';
     
-    if (mode === ScanMode.ID_CARD && idCardScan.front && idCardScan.back) {
-      const layout = await createIDCardLayout(idCardScan.front.enhancedUrl, idCardScan.back.enhancedUrl);
-      blob = await generateIDCardPDF(layout, quality);
+    if (mode === ScanMode.ID_CARD && finalIdCardScan.front && finalIdCardScan.back) {
+      const layout = await createIDCardLayout(finalIdCardScan.front.enhancedUrl, finalIdCardScan.back.enhancedUrl);
+      blob = await generateIDCardPDF(layout, quality, colorMode);
       thumbnail = layout;
     } else {
-      blob = await generatePDF(scans, pdfName, selectedPageSize, quality);
-      thumbnail = scans[0]?.enhancedUrl || '';
+      blob = await generatePDF(finalScans, pdfName, selectedPageSize, quality, colorMode, bookStyle);
+      thumbnail = finalScans[0]?.enhancedUrl || '';
     }
 
     const fileName = `${pdfName || 'MagicScan'}_${new Date().getTime()}.pdf`;
@@ -400,9 +513,12 @@ export default function App() {
       mode,
       timestamp: Date.now(),
       thumbnail,
-      scans: mode === ScanMode.ID_CARD ? [idCardScan.front, idCardScan.back] : [...scans],
+      scans: mode === ScanMode.ID_CARD ? [finalIdCardScan.front, finalIdCardScan.back] : [...finalScans],
       pageSize: selectedPageSize,
-      quality
+      quality,
+      colorMode,
+      bookStyle,
+      performBatchOCR
     };
 
     setSavedDocs(prev => [newDoc, ...prev]);
@@ -433,9 +549,9 @@ export default function App() {
     let blob: Blob;
     if (doc.mode === ScanMode.ID_CARD) {
       const layout = await createIDCardLayout(doc.scans[0].enhancedUrl, doc.scans[1].enhancedUrl);
-      blob = await generateIDCardPDF(layout, doc.quality || 0.8);
+      blob = await generateIDCardPDF(layout, doc.quality || 0.8, doc.colorMode || ColorMode.COLOR);
     } else {
-      blob = await generatePDF(doc.scans, doc.name, doc.pageSize, doc.quality || 0.8);
+      blob = await generatePDF(doc.scans, doc.name, doc.pageSize, doc.quality || 0.8, doc.colorMode || ColorMode.COLOR, doc.bookStyle || BookStyle.ONE_BY_ONE);
     }
 
     const file = new File([blob], `${doc.name}.pdf`, { type: 'application/pdf' });
@@ -685,20 +801,39 @@ export default function App() {
               </div>
             </div>
 
-            {savedDocs.length === 0 ? (
+            {/* Library Tabs */}
+            <div className="flex gap-2 p-1 bg-white rounded-2xl border border-[#141414]/5 shadow-sm overflow-x-auto">
+              {['ALL', ScanMode.SINGLE, ScanMode.BOOK, ScanMode.ID_CARD].map((tab) => (
+                <button
+                  key={tab}
+                  onClick={() => setLibraryFilter(tab)}
+                  className={`px-4 py-2 rounded-xl text-xs font-bold whitespace-nowrap transition-all ${
+                    libraryFilter === tab 
+                      ? 'bg-emerald-600 text-white shadow-md' 
+                      : 'text-[#141414]/40 hover:bg-emerald-50'
+                  }`}
+                >
+                  {tab === 'ALL' ? 'All Scans' : tab === ScanMode.SINGLE ? 'Single Pages' : tab === ScanMode.BOOK ? 'Books' : 'ID Cards'}
+                </button>
+              ))}
+            </div>
+
+            {savedDocs.filter(d => libraryFilter === 'ALL' || d.mode === libraryFilter).length === 0 ? (
               <div className="text-center py-20 bg-white rounded-3xl border border-dashed border-[#141414]/10">
                 <Library size={48} className="mx-auto mb-4 text-[#141414]/20" />
-                <p className="text-[#141414]/40 font-medium">No saved documents yet.</p>
+                <p className="text-[#141414]/40 font-medium">No documents found in this category.</p>
                 <button 
                   onClick={() => setView('scanner')}
                   className="mt-4 text-emerald-600 font-bold hover:underline"
                 >
-                  Go to Scanner
+                  Start Scanning
                 </button>
               </div>
             ) : (
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                {savedDocs.map((doc) => (
+                {savedDocs
+                  .filter(d => libraryFilter === 'ALL' || d.mode === libraryFilter)
+                  .map((doc) => (
                   <motion.div 
                     key={doc.id}
                     layout
@@ -796,6 +931,71 @@ export default function App() {
                 </div>
 
                 <div>
+                  <label className="text-xs font-bold uppercase tracking-widest opacity-40 mb-2 block">Color Mode</label>
+                  <div className="grid grid-cols-3 gap-2">
+                    {[
+                      { id: ColorMode.COLOR, label: 'Color' },
+                      { id: ColorMode.GRAYSCALE, label: 'Grayscale' },
+                      { id: ColorMode.BLACK_WHITE, label: 'B&W' },
+                    ].map((mode) => (
+                      <button
+                        key={mode.id}
+                        onClick={() => setColorMode(mode.id)}
+                        className={`py-3 rounded-xl text-xs font-bold border-2 transition-all ${
+                          colorMode === mode.id 
+                            ? 'border-emerald-500 bg-emerald-50 text-emerald-600' 
+                            : 'border-[#141414]/5 text-[#141414]/40 hover:border-emerald-200'
+                        }`}
+                      >
+                        {mode.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                {mode === ScanMode.BOOK && (
+                  <div>
+                    <label className="text-xs font-bold uppercase tracking-widest opacity-40 mb-2 block">Book Style</label>
+                    <div className="grid grid-cols-2 gap-2">
+                      {[
+                        { id: BookStyle.ONE_BY_ONE, label: 'One by One' },
+                        { id: BookStyle.FLIP, label: 'Flip Mode' },
+                      ].map((style) => (
+                        <button
+                          key={style.id}
+                          onClick={() => setBookStyle(style.id)}
+                          className={`py-3 rounded-xl text-xs font-bold border-2 transition-all ${
+                            bookStyle === style.id 
+                              ? 'border-emerald-500 bg-emerald-50 text-emerald-600' 
+                              : 'border-[#141414]/5 text-[#141414]/40 hover:border-emerald-200'
+                          }`}
+                        >
+                          {style.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                <div className="flex items-center justify-between bg-[#F5F5F0] p-4 rounded-2xl">
+                  <div className="flex items-center gap-3">
+                    <div className="w-10 h-10 bg-indigo-100 text-indigo-600 rounded-xl flex items-center justify-center">
+                      <Type size={20} />
+                    </div>
+                    <div>
+                      <p className="text-sm font-bold">Batch OCR</p>
+                      <p className="text-[10px] opacity-50">Extract text from all scans</p>
+                    </div>
+                  </div>
+                  <button 
+                    onClick={() => setPerformBatchOCR(!performBatchOCR)}
+                    className={`w-12 h-6 rounded-full transition-all relative ${performBatchOCR ? 'bg-emerald-500' : 'bg-gray-300'}`}
+                  >
+                    <div className={`absolute top-1 w-4 h-4 bg-white rounded-full transition-all ${performBatchOCR ? 'left-7' : 'left-1'}`} />
+                  </button>
+                </div>
+
+                <div>
                   <div className="flex justify-between mb-2">
                     <label className="text-xs font-bold uppercase tracking-widest opacity-40 block">Image Quality</label>
                     <span className="text-xs font-bold text-emerald-600">{Math.round(quality * 100)}%</span>
@@ -819,7 +1019,7 @@ export default function App() {
                     Cancel
                   </button>
                   <button 
-                    onClick={confirmSave}
+                    onClick={() => setShowConfirmDownload(true)}
                     className="flex-[2] bg-emerald-600 text-white py-4 rounded-2xl font-bold hover:bg-emerald-700 transition-all shadow-xl shadow-emerald-100"
                   >
                     Save & Download
@@ -894,6 +1094,7 @@ export default function App() {
                 ref={videoRef} 
                 autoPlay 
                 playsInline 
+                muted
                 className="w-full h-full object-cover"
               />
               {edgeDetection && edgeOverlay && (
@@ -926,7 +1127,11 @@ export default function App() {
             </div>
 
             <div className="p-10 flex items-center justify-center gap-12">
-              <button className="p-4 text-white/40 hover:text-white transition-colors">
+              <button 
+                onClick={() => fileInputRef.current?.click()}
+                className="p-4 text-white/40 hover:text-white transition-colors"
+                title="Import from storage"
+              >
                 <ImageIcon size={28} />
               </button>
               <button 
@@ -940,6 +1145,77 @@ export default function App() {
               </div>
             </div>
             <canvas ref={canvasRef} className="hidden" />
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* Confirmation Dialog */}
+      <AnimatePresence>
+        {showConfirmDownload && (
+          <motion.div 
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-[110] bg-black/80 backdrop-blur-md flex items-center justify-center p-6"
+          >
+            <motion.div 
+              initial={{ scale: 0.9, y: 20 }}
+              animate={{ scale: 1, y: 0 }}
+              className="bg-white w-full max-w-sm rounded-3xl p-8 shadow-2xl text-center"
+            >
+              <div className="w-16 h-16 bg-emerald-100 text-emerald-600 rounded-full flex items-center justify-center mx-auto mb-6">
+                <FileCheck size={32} />
+              </div>
+              <h3 className="text-xl font-bold mb-2">Ready to Download?</h3>
+              <p className="text-sm text-[#141414]/60 mb-6">Please confirm your selection before we generate your PDF.</p>
+              
+              <div className="bg-[#F5F5F0] rounded-2xl p-4 mb-8 text-left space-y-3">
+                <div className="flex justify-between text-xs">
+                  <span className="opacity-40 font-bold uppercase">Name</span>
+                  <span className="font-bold">{pdfName || 'Untitled'}</span>
+                </div>
+                <div className="flex justify-between text-xs">
+                  <span className="opacity-40 font-bold uppercase">Page Size</span>
+                  <span className="font-bold">{selectedPageSize}</span>
+                </div>
+                <div className="flex justify-between text-xs">
+                  <span className="opacity-40 font-bold uppercase">Color Mode</span>
+                  <span className="font-bold">{colorMode}</span>
+                </div>
+                <div className="flex justify-between text-xs">
+                  <span className="opacity-40 font-bold uppercase">Quality</span>
+                  <span className="font-bold">{Math.round(quality * 100)}%</span>
+                </div>
+                {mode === ScanMode.BOOK && (
+                  <div className="flex justify-between text-xs">
+                    <span className="opacity-40 font-bold uppercase">Book Style</span>
+                    <span className="font-bold">{bookStyle}</span>
+                  </div>
+                )}
+                <div className="flex justify-between text-xs">
+                  <span className="opacity-40 font-bold uppercase">Batch OCR</span>
+                  <span className={`font-bold ${performBatchOCR ? 'text-indigo-600' : ''}`}>{performBatchOCR ? 'Enabled' : 'Disabled'}</span>
+                </div>
+              </div>
+
+              <div className="flex gap-3">
+                <button 
+                  onClick={() => setShowConfirmDownload(false)}
+                  className="flex-1 py-4 rounded-2xl font-bold text-[#141414]/40 hover:bg-gray-50 transition-all"
+                >
+                  Back
+                </button>
+                <button 
+                  onClick={() => {
+                    setShowConfirmDownload(false);
+                    confirmSave();
+                  }}
+                  className="flex-[2] bg-emerald-600 text-white py-4 rounded-2xl font-bold hover:bg-emerald-700 transition-all shadow-xl shadow-emerald-100"
+                >
+                  Confirm
+                </button>
+              </div>
+            </motion.div>
           </motion.div>
         )}
       </AnimatePresence>
@@ -961,31 +1237,103 @@ export default function App() {
               <div className="flex items-center gap-2">
                 <button 
                   onClick={handleRetake}
-                  className="flex items-center gap-2 text-orange-600 font-bold text-sm px-4 py-2 hover:bg-orange-50 rounded-full"
+                  className="flex items-center gap-2 text-orange-600 font-bold text-sm px-4 py-2 hover:bg-orange-50 rounded-full transition-all active:scale-95"
+                  title="Discard and retake photo"
                 >
                   <RefreshCw size={18} />
                   <span>Retake</span>
                 </button>
                 <button 
-                  onClick={() => setIsCropping(!isCropping)}
-                  className={`flex items-center gap-2 font-bold text-sm px-4 py-2 rounded-full transition-all ${isCropping ? 'bg-emerald-600 text-white' : 'text-emerald-600 hover:bg-emerald-50'}`}
+                  onClick={() => { setIsCropping(!isCropping); setIsResizing(false); setIsPerspective(false); }}
+                  className={`flex items-center gap-2 font-bold text-sm px-4 py-2 rounded-full transition-all active:scale-95 ${isCropping && !isPerspective ? 'bg-emerald-600 text-white shadow-lg' : 'text-emerald-600 hover:bg-emerald-50'}`}
                 >
                   <Crop size={18} />
-                  <span>{isCropping ? 'Cancel Crop' : 'Crop'}</span>
+                  <span>Crop</span>
+                </button>
+                <button 
+                  onClick={() => { setIsCropping(!isCropping); setIsPerspective(true); setIsResizing(false); }}
+                  className={`flex items-center gap-2 font-bold text-sm px-4 py-2 rounded-full transition-all active:scale-95 ${isCropping && isPerspective ? 'bg-orange-600 text-white shadow-lg' : 'text-orange-600 hover:bg-orange-50'}`}
+                >
+                  <Maximize2 size={18} />
+                  <span>Perspective</span>
+                </button>
+                <button 
+                  onClick={() => { setIsResizing(!isResizing); setIsCropping(false); setIsPerspective(false); }}
+                  className={`flex items-center gap-2 font-bold text-sm px-4 py-2 rounded-full transition-all active:scale-95 ${isResizing ? 'bg-blue-600 text-white shadow-lg' : 'text-blue-600 hover:bg-blue-50'}`}
+                >
+                  <Maximize2 size={18} />
+                  <span>Resize</span>
                 </button>
                 <button 
                   onClick={() => handleOCR(activePreview)}
-                  className="flex items-center gap-2 text-indigo-600 font-bold text-sm px-4 py-2 hover:bg-indigo-50 rounded-full"
+                  className="flex items-center gap-2 text-indigo-600 font-bold text-sm px-4 py-2 hover:bg-indigo-50 rounded-full transition-all active:scale-95"
                 >
                   <Type size={18} />
-                  <span>Extract Text</span>
+                  <span>OCR</span>
                 </button>
               </div>
             </div>
 
-            <div className="flex-1 overflow-auto p-6 flex flex-col md:flex-row gap-8 items-center justify-center">
-              <div className="relative max-w-md w-full shadow-2xl rounded-lg overflow-hidden border">
-                <img src={activePreview.enhancedUrl} className="w-full h-auto" />
+            {/* Color Mode Selector in Preview */}
+            <div className="bg-white px-6 py-2 border-b flex items-center gap-4 overflow-x-auto">
+              <span className="text-[10px] font-bold uppercase tracking-widest opacity-40 whitespace-nowrap">Preview Mode:</span>
+              <div className="flex gap-2">
+                {[
+                  { id: ColorMode.COLOR, label: 'Color' },
+                  { id: ColorMode.GRAYSCALE, label: 'Grayscale' },
+                  { id: ColorMode.BLACK_WHITE, label: 'B&W' },
+                ].map((m) => (
+                  <button
+                    key={m.id}
+                    onClick={() => setColorMode(m.id)}
+                    className={`px-3 py-1 rounded-full text-[10px] font-bold transition-all border ${
+                      colorMode === m.id 
+                        ? 'bg-emerald-600 text-white border-emerald-600' 
+                        : 'text-[#141414]/40 border-[#141414]/10 hover:border-emerald-600'
+                    }`}
+                  >
+                    {m.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div className="flex-1 overflow-auto p-6 flex flex-col items-center justify-center bg-[#F0F0EB]">
+              {isResizing && (
+                <motion.div 
+                  initial={{ opacity: 0, y: -10 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  className="mb-6 bg-white p-2 rounded-2xl shadow-xl border border-[#141414]/5 flex gap-2"
+                >
+                  {[
+                    { label: 'Original', value: 'original' },
+                    { label: 'A4 (1:1.41)', value: 1/1.414 },
+                    { label: '3:4', value: 3/4 },
+                    { label: '1:1', value: 1 },
+                  ].map((opt) => (
+                    <button
+                      key={opt.label}
+                      onClick={() => handleResize(opt.value as any)}
+                      className="px-4 py-2 rounded-xl text-xs font-bold hover:bg-blue-50 text-blue-600 transition-colors"
+                    >
+                      {opt.label}
+                    </button>
+                  ))}
+                </motion.div>
+              )}
+
+              <div className="relative max-w-md w-full shadow-[0_32px_64px_-12px_rgba(0,0,0,0.2)] rounded-lg overflow-hidden border-8 border-white transition-all duration-300">
+                <img 
+                  src={activePreview.enhancedUrl} 
+                  className="w-full h-auto transition-all duration-300" 
+                  style={{
+                    filter: colorMode === ColorMode.GRAYSCALE 
+                      ? 'grayscale(100%)' 
+                      : colorMode === ColorMode.BLACK_WHITE 
+                        ? 'grayscale(100%) contrast(150%) brightness(110%)' 
+                        : 'none'
+                  }}
+                />
                 
                 {isCropping && (
                   <div 
@@ -994,41 +1342,88 @@ export default function App() {
                     onMouseUp={() => setIsDraggingCrop(null)}
                     onMouseLeave={() => setIsDraggingCrop(null)}
                   >
-                    <div 
-                      className="absolute border-2 border-emerald-500 bg-emerald-500/10 shadow-[0_0_0_9999px_rgba(0,0,0,0.4)] cursor-move"
-                      style={{
-                        left: `${cropBox.x}%`,
-                        top: `${cropBox.y}%`,
-                        width: `${cropBox.w}%`,
-                        height: `${cropBox.h}%`
-                      }}
-                      onMouseDown={() => setIsDraggingCrop('move')}
-                    >
+                    {!isPerspective ? (
                       <div 
-                        className="absolute -top-2 -left-2 w-5 h-5 bg-emerald-500 rounded-full cursor-nw-resize border-2 border-white" 
-                        onMouseDown={(e) => { e.stopPropagation(); setIsDraggingCrop('nw'); }}
-                      />
-                      <div 
-                        className="absolute -top-2 -right-2 w-5 h-5 bg-emerald-500 rounded-full cursor-ne-resize border-2 border-white" 
-                        onMouseDown={(e) => { e.stopPropagation(); setIsDraggingCrop('ne'); }}
-                      />
-                      <div 
-                        className="absolute -bottom-2 -left-2 w-5 h-5 bg-emerald-500 rounded-full cursor-sw-resize border-2 border-white" 
-                        onMouseDown={(e) => { e.stopPropagation(); setIsDraggingCrop('sw'); }}
-                      />
-                      <div 
-                        className="absolute -bottom-2 -right-2 w-5 h-5 bg-emerald-500 rounded-full cursor-se-resize border-2 border-white" 
-                        onMouseDown={(e) => { e.stopPropagation(); setIsDraggingCrop('se'); }}
-                      />
-                      
-                      <button 
-                        onClick={handleCrop}
-                        className="absolute -bottom-14 left-1/2 -translate-x-1/2 bg-emerald-600 text-white px-6 py-2 rounded-full text-sm font-bold shadow-xl flex items-center gap-2 whitespace-nowrap hover:bg-emerald-700 active:scale-95 transition-all"
+                        className="absolute border-2 border-emerald-400 bg-emerald-400/10 shadow-[0_0_0_9999px_rgba(0,0,0,0.5)] cursor-move"
+                        style={{
+                          left: `${cropBox.x}%`,
+                          top: `${cropBox.y}%`,
+                          width: `${cropBox.w}%`,
+                          height: `${cropBox.h}%`
+                        }}
+                        onMouseDown={() => setIsDraggingCrop('move')}
                       >
-                        <Check size={16} />
-                        Apply Crop
-                      </button>
-                    </div>
+                        {/* Grid Lines */}
+                        <div className="absolute inset-0 grid grid-cols-3 grid-rows-3 pointer-events-none">
+                          <div className="border-r border-white/30 border-b" />
+                          <div className="border-r border-white/30 border-b" />
+                          <div className="border-b border-white/30" />
+                          <div className="border-r border-white/30 border-b" />
+                          <div className="border-r border-white/30 border-b" />
+                          <div className="border-b border-white/30" />
+                          <div className="border-r border-white/30" />
+                          <div className="border-r border-white/30" />
+                          <div className="" />
+                        </div>
+
+                        {/* Handles */}
+                        {[
+                          { id: 'nw', pos: '-top-3 -left-3' },
+                          { id: 'ne', pos: '-top-3 -right-3' },
+                          { id: 'sw', pos: '-bottom-3 -left-3' },
+                          { id: 'se', pos: '-bottom-3 -right-3' },
+                        ].map(h => (
+                          <div 
+                            key={h.id}
+                            className={`absolute ${h.pos} w-8 h-8 flex items-center justify-center cursor-pointer group`}
+                            onMouseDown={(e) => { e.stopPropagation(); setIsDraggingCrop(h.id); }}
+                          >
+                            <div className="w-4 h-4 bg-emerald-500 rounded-full border-2 border-white shadow-lg group-hover:scale-125 transition-transform" />
+                          </div>
+                        ))}
+                      </div>
+                    ) : (
+                      <div className="absolute inset-0">
+                        <svg className="absolute inset-0 w-full h-full pointer-events-none">
+                          <polygon 
+                            points={corners.map(c => `${(c.x / 100) * 100}%,${(c.y / 100) * 100}%`).join(' ')} 
+                            className="fill-orange-500/20 stroke-orange-500 stroke-2"
+                            style={{ vectorEffect: 'non-scaling-stroke' }}
+                          />
+                          {/* We need to use actual pixel values for the SVG points if we want it to work perfectly, 
+                              but percentages in SVG can be tricky. Let's use a simpler approach. */}
+                        </svg>
+                        {/* Better SVG for polygon */}
+                        <div className="absolute inset-0 overflow-hidden">
+                           <svg width="100%" height="100%" viewBox="0 0 100 100" preserveAspectRatio="none" className="pointer-events-none">
+                             <polygon 
+                               points={corners.map(c => `${c.x},${c.y}`).join(' ')} 
+                               className="fill-orange-500/20 stroke-orange-500 stroke-[0.5]"
+                             />
+                           </svg>
+                        </div>
+
+                        {corners.map((c, i) => (
+                          <div 
+                            key={i}
+                            className="absolute w-10 h-10 -translate-x-1/2 -translate-y-1/2 flex items-center justify-center cursor-pointer group z-10"
+                            style={{ left: `${c.x}%`, top: `${c.y}%` }}
+                            onMouseDown={(e) => { e.stopPropagation(); setIsDraggingCrop(i.toString()); }}
+                          >
+                            <div className="w-5 h-5 bg-orange-500 rounded-full border-2 border-white shadow-xl group-hover:scale-125 transition-transform" />
+                            <span className="absolute -top-6 bg-orange-600 text-white text-[8px] px-1 rounded font-bold">P{i+1}</span>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+
+                    <button 
+                      onClick={handleCrop}
+                      className={`absolute -bottom-16 left-1/2 -translate-x-1/2 text-white px-8 py-3 rounded-full text-sm font-bold shadow-2xl flex items-center gap-2 whitespace-nowrap active:scale-95 transition-all ${isPerspective ? 'bg-orange-600 hover:bg-orange-700' : 'bg-emerald-600 hover:bg-emerald-700'}`}
+                    >
+                      <Check size={18} />
+                      Apply {isPerspective ? 'Perspective' : 'Selection'}
+                    </button>
                   </div>
                 )}
               </div>

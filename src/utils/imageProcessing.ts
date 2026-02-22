@@ -3,6 +3,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+import { ColorMode } from '../types';
+
 export function enhanceImage(dataUrl: string): Promise<string> {
   return new Promise((resolve) => {
     const img = new Image();
@@ -38,24 +40,61 @@ export function enhanceImage(dataUrl: string): Promise<string> {
       const threshold = min + range * 0.5; // Simple global threshold for fallback
 
       for (let i = 0; i < data.length; i += 4) {
+        // Apply enhancement to each channel individually to preserve color
+        for (let j = 0; j < 3; j++) {
+          let val = data[i + j];
+          
+          // Contrast stretching
+          val = ((val - min) / (range || 1)) * 255;
+          
+          // Gamma correction for brightness
+          val = 255 * Math.pow(val / 255, 0.8);
+          
+          // Subtle background cleaning (only if very bright)
+          if (val > 235) val = 255;
+          
+          data[i + j] = Math.max(0, Math.min(255, val));
+        }
+      }
+
+      ctx.putImageData(imageData, 0, 0);
+      resolve(canvas.toDataURL('image/jpeg', 0.9));
+    };
+    img.src = dataUrl;
+  });
+}
+
+export function applyColorMode(dataUrl: string, mode: ColorMode): Promise<string> {
+  if (mode === ColorMode.COLOR) return Promise.resolve(dataUrl);
+
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => {
+      const canvas = document.createElement('canvas');
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return resolve(dataUrl);
+
+      canvas.width = img.width;
+      canvas.height = img.height;
+      ctx.drawImage(img, 0, 0);
+
+      const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      const data = imageData.data;
+
+      for (let i = 0; i < data.length; i += 4) {
         const r = data[i];
         const g = data[i + 1];
         const b = data[i + 2];
-        const gray = (r + g + b) / 3;
-
-        // Adaptive logic: if pixel is significantly brighter than local neighborhood (simulated by global min/max)
-        // we push it towards white, otherwise towards black (but keeping some detail)
-        let val = ((gray - min) / range) * 255;
         
-        // Gamma correction
-        val = 255 * Math.pow(val / 255, 0.7);
-        
-        // If it's very bright, make it pure white (document background)
-        if (val > 200) val = 255;
-        // If it's very dark, make it pure black (text)
-        else if (val < 50) val = 0;
+        // Grayscale conversion (Luminance)
+        let gray = 0.299 * r + 0.587 * g + 0.114 * b;
 
-        data[i] = data[i + 1] = data[i + 2] = val;
+        if (mode === ColorMode.BLACK_WHITE) {
+          // Simple thresholding for B&W
+          gray = gray > 128 ? 255 : 0;
+        }
+
+        data[i] = data[i + 1] = data[i + 2] = gray;
       }
 
       ctx.putImageData(imageData, 0, 0);
@@ -140,6 +179,80 @@ export function cropImage(dataUrl: string, x: number, y: number, width: number, 
       canvas.height = height;
       ctx.drawImage(img, x, y, width, height, 0, 0, width, height);
       resolve(canvas.toDataURL('image/jpeg', 0.9));
+    };
+    img.src = dataUrl;
+  });
+}
+
+export function perspectiveWarp(
+  dataUrl: string, 
+  corners: { x: number, y: number }[], 
+  outWidth: number, 
+  outHeight: number
+): Promise<string> {
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => {
+      const canvas = document.createElement('canvas');
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return resolve(dataUrl);
+
+      canvas.width = outWidth;
+      canvas.height = outHeight;
+
+      // We'll use a simple approach: for each pixel in the output, 
+      // find the corresponding pixel in the input using the inverse transform.
+      // We need the perspective-transform library for this.
+      // But since we can't easily import it here without a build step in this tool,
+      // I'll implement a basic homography solver or just use the library if I can import it.
+      
+      // Actually, I'll use the library I just installed.
+      import('perspective-transform').then((PerspT) => {
+        const srcCorners = [
+          corners[0].x, corners[0].y,
+          corners[1].x, corners[1].y,
+          corners[2].x, corners[2].y,
+          corners[3].x, corners[3].y
+        ];
+        const dstCorners = [
+          0, 0,
+          outWidth, 0,
+          outWidth, outHeight,
+          0, outHeight
+        ];
+
+        const perspT = (PerspT as any).default(srcCorners, dstCorners);
+        const invT = (PerspT as any).default(dstCorners, srcCorners);
+
+        const inputCanvas = document.createElement('canvas');
+        inputCanvas.width = img.width;
+        inputCanvas.height = img.height;
+        const inputCtx = inputCanvas.getContext('2d')!;
+        inputCtx.drawImage(img, 0, 0);
+        const inputData = inputCtx.getImageData(0, 0, img.width, img.height);
+        
+        const outputData = ctx.createImageData(outWidth, outHeight);
+
+        for (let y = 0; y < outHeight; y++) {
+          for (let x = 0; x < outWidth; x++) {
+            const srcPt = invT.transform(x, y);
+            const sx = Math.floor(srcPt[0]);
+            const sy = Math.floor(srcPt[1]);
+
+            if (sx >= 0 && sx < img.width && sy >= 0 && sy < img.height) {
+              const outIdx = (y * outWidth + x) * 4;
+              const inIdx = (sy * img.width + sx) * 4;
+              outputData.data[outIdx] = inputData.data[inIdx];
+              outputData.data[outIdx + 1] = inputData.data[inIdx + 1];
+              outputData.data[outIdx + 2] = inputData.data[inIdx + 2];
+              outputData.data[outIdx + 3] = inputData.data[inIdx + 3];
+            }
+          }
+        }
+
+        ctx.putImageData(outputData, 0, 0);
+        resolve(canvas.toDataURL('image/jpeg', 0.9));
+      });
     };
     img.src = dataUrl;
   });
