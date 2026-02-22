@@ -1180,6 +1180,44 @@ export default function App() {
         )}
       </AnimatePresence>
 
+      {/* Install Banner */}
+      <AnimatePresence>
+        {showInstallBtn && (
+          <motion.div 
+            initial={{ y: 100, opacity: 0 }}
+            animate={{ y: 0, opacity: 1 }}
+            exit={{ y: 100, opacity: 0 }}
+            className="fixed bottom-6 left-6 right-6 z-[120] md:left-auto md:right-6 md:w-96"
+          >
+            <div className="bg-[#141414] text-white p-6 rounded-3xl shadow-2xl flex flex-col gap-4 border border-white/10">
+              <div className="flex items-start gap-4">
+                <div className="w-12 h-12 bg-emerald-500 rounded-2xl flex items-center justify-center shrink-0 shadow-lg shadow-emerald-500/20">
+                  <FileDown size={24} className="text-white" />
+                </div>
+                <div>
+                  <h4 className="font-bold text-lg">Install MagicScan</h4>
+                  <p className="text-sm text-white/60">Add to your home screen for a faster, app-like experience.</p>
+                </div>
+              </div>
+              <div className="flex gap-3">
+                <button 
+                  onClick={() => setShowInstallBtn(false)}
+                  className="flex-1 py-3 rounded-xl font-bold text-white/40 hover:bg-white/5 transition-all"
+                >
+                  Later
+                </button>
+                <button 
+                  onClick={handleInstallClick}
+                  className="flex-[2] bg-emerald-500 text-white py-3 rounded-xl font-bold hover:bg-emerald-600 transition-all shadow-lg shadow-emerald-500/20 active:scale-95"
+                >
+                  Install Now
+                </button>
+              </div>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
       {/* Confirmation Dialog */}
       <AnimatePresence>
         {showConfirmDownload && (
