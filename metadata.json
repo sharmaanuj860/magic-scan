@@ -1,0 +1,5 @@
+{
+  "name": "Magic PDF Scan",
+  "description": "Scan your images and convert to high-quality PDFs with AI enhancement and OCR.",
+  "requestFramePermissions": ["camera"]
+}
