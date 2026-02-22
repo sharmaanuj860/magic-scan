@@ -145,6 +145,28 @@ export default function App() {
     { x: 10, y: 90 }
   ]);
   const [isDraggingCrop, setIsDraggingCrop] = useState<string | null>(null);
+  const [deferredPrompt, setDeferredPrompt] = useState<any>(null);
+  const [showInstallBtn, setShowInstallBtn] = useState(false);
+
+  useEffect(() => {
+    const handler = (e: any) => {
+      e.preventDefault();
+      setDeferredPrompt(e);
+      setShowInstallBtn(true);
+    };
+    window.addEventListener('beforeinstallprompt', handler);
+    return () => window.removeEventListener('beforeinstallprompt', handler);
+  }, []);
+
+  const handleInstallClick = async () => {
+    if (!deferredPrompt) return;
+    deferredPrompt.prompt();
+    const { outcome } = await deferredPrompt.userChoice;
+    if (outcome === 'accepted') {
+      setShowInstallBtn(false);
+    }
+    setDeferredPrompt(null);
+  };
 
   const handleResize = async (ratio: number | 'original') => {
     if (!activePreview) return;
@@ -596,6 +618,15 @@ export default function App() {
         </div>
 
         <div className="flex items-center gap-3">
+          {showInstallBtn && (
+            <button 
+              onClick={handleInstallClick}
+              className="flex items-center gap-2 bg-indigo-600 text-white px-3 py-1.5 rounded-full text-xs font-bold hover:bg-indigo-700 transition-all active:scale-95 shadow-md"
+            >
+              <Plus size={14} />
+              <span>Install App</span>
+            </button>
+          )}
           <button 
             onClick={() => setView(view === 'scanner' ? 'library' : 'scanner')}
             className={`p-2 rounded-full transition-colors ${view === 'library' ? 'bg-emerald-600 text-white' : 'text-emerald-600 hover:bg-emerald-50'}`}
